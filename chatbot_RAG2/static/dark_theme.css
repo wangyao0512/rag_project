@@ -1,0 +1,198 @@
+:root {
+    --background-fill-primary: #0d0d0d;
+    --background-fill-secondary: #1a1a1a;
+    --border-color-accent: #444;
+    --border-color-primary: #333;
+    --body-text-color: #f0f0f0;
+    --body-text-color-subdued: #b0b0b0;
+    --link-text-color: #4da6ff;
+    --link-text-color-hover: #66b3ff;
+    --button-primary-background-fill: #1f1f1f;
+    --button-primary-background-fill-hover: #2e2e2e;
+    --block-title-text-color: #f0f0f0;
+    --block-label-text-color: #ccc;
+    --block-background-fill: #1a1a1a;
+    --input-background-fill: #222;
+    --input-border-color: #444;
+    --error-text-color: #ff6666;
+}
+
+/* 应用深色主题到整个页面 */
+body {
+    background-color: var(--background-fill-primary);
+    color: var(--body-text-color);
+}
+
+/* 覆盖Gradio默认组件样式 */
+.gradio-container {
+    background-color: var(--background-fill-primary);
+}
+
+/* 头部Markdown区域 */
+.gr-markdown h1 {
+    color: #f0f0f0;
+}
+
+/* 按钮样式 */
+button {
+    background-color: var(--button-primary-background-fill) !important;
+    color: var(--body-text-color) !important;
+    border: 1px solid var(--border-color-accent) !important;
+}
+
+button:hover {
+    background-color: var(--button-primary-background-fill-hover) !important;
+}
+
+/* 输入框样式 */
+input[type="text"], textarea {
+    background-color: var(--input-background-fill) !important;
+    border: 1px solid var(--input-border-color) !important;
+    color: var(--body-text-color) !important;
+}
+
+input[type="text"]:focus, textarea:focus {
+    border-color: var(--link-text-color) !important;
+    box-shadow: 0 0 0 2px rgba(77, 166, 255, 0.2) !important;
+}
+
+/* 选项卡样式 */
+.tabs {
+    background-color: var(--background-fill-secondary) !important;
+    border: 1px solid var(--border-color-primary) !important;
+}
+
+.tab-nav button {
+    background-color: transparent !important;
+    color: var(--body-text-color-subdued) !important;
+    border: none !important;
+}
+
+.tab-nav button.selected {
+    color: var(--link-text-color) !important;
+    border-bottom: 2px solid var(--link-text-color) !important;
+}
+
+/* 聊天界面特殊处理 */
+.chatbot .message-row.user {
+    background-color: #222 !important;
+}
+
+.chatbot .message-row.bot {
+    background-color: #1a1a1a !important;
+}
+
+/* JSON显示组件 */
+.json-container {
+    background-color: var(--input-background-fill) !important;
+    border: 1px solid var(--input-border-color) !important;
+    color: var(--body-text-color) !important;
+}
+
+/* 滚动条样式 */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1a1a1a;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #444;
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+/* 保持原有的引用样式 */
+.citation-link {
+    color: #4da6ff;
+    cursor: pointer;
+    font-weight: 600;
+    text-decoration: none;
+    margin-left: 0;
+    margin-right: 0;
+    display: inline;
+    position: relative;
+}
+
+.citation-link:hover {
+    color: #66b3ff;
+    text-decoration: underline;
+}
+
+/* 工具提示样式保持不变，但适配深色主题 */
+.citation-tooltip {
+    position: absolute;
+    background-color: #2d2d2d;
+    border: 2px solid #4da6ff;
+    border-radius: 8px;
+    padding: 12px 16px;
+    max-width: 500px;
+    max-height: 400px;
+    overflow-y: auto;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 10000;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #f0f0f0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.citation-tooltip::-webkit-scrollbar {
+    width: 8px;
+}
+
+.citation-tooltip::-webkit-scrollbar-track {
+    background: #1a1a1a;
+    border-radius: 4px;
+}
+
+.citation-tooltip::-webkit-scrollbar-thumb {
+    background: #4da6ff;
+    border-radius: 4px;
+}
+
+.citation-tooltip::-webkit-scrollbar-thumb:hover {
+    background: #66b3ff;
+}
+
+.citation-tooltip::before {
+    content: '📚 引用内容';
+    display: block;
+    font-weight: bold;
+    color: #4da6ff;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #444;
+}
+
+.citation-tooltip-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    cursor: pointer;
+    color: #b0b0b0;
+    font-size: 18px;
+    font-weight: bold;
+    line-height: 1;
+    padding: 4px 8px;
+}
+
+.citation-tooltip-close:hover {
+    color: #f0f0f0;
+}
+
+.citation-source-info {
+    font-weight: bold;
+    color: #4da6ff;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #444;
+    font-size: 13px;
+}
