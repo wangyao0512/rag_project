@@ -3,10 +3,11 @@ LLM handler using OpenAI-compatible Qwen HTTP API
 """
 from typing import Dict, List, Optional, Generator, Union, Any
 import json
-import os
 import re
 from loguru import logger
-from openai import OpenAI
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
+from langchain_openai import ChatOpenAI
 from config import Config
 from src.chat.prompts import PromptTemplates, RefusalMessages
 from src.prompts.two_stage_prompts import DECIDER_PROMPT, MELANOMA_STAGING_EXTRACTION_PROMPT
@@ -15,70 +16,9 @@ from src.retrieval.evidence_models import EvidenceBundle
 # 从全局配置里拿参数
 DEFAULT_CHAT_BASE_URL = Config.CHAT_BASE_URL
 DEFAULT_CHAT_MODEL = Config.CHAT_MODEL
-DEFAULT_API_KEY = Config.OPENAI_API_KEY
-
-
-class OpenAIChatLLM:
-    """
-    一个小封装，让 OpenAI Chat 接口看起来像 llama_cpp 的 Llama：
-    - 非流式：返回 {"choices": [{"text": "...."}]}
-    - 流式：yield {"choices": [{"text": "token"}]}
-    """
-
-    def __init__(self, base_url: str, api_key: str, model: str):
-        self.client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key)
-        self.model = model
-
-    def __call__(
-        self,
-        prompt: str,
-        max_tokens: int = 512,
-        temperature: float = 0.5,
-        top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
-        stream: bool = False,
-        repeat_penalty: Optional[float] = None,  # 兼容 llama_cpp，占位即可
-        **kwargs,
-    ):
-        messages = [
-            {
-                "role": "user",
-                # 你的 prompt 本身已经带 <|im_start|>system/user 等标签，直接塞进去即可
-                "content": prompt,
-            }
-        ]
-
-        if not stream:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                stream=False,
-            )
-            content = resp.choices[0].message.content or ""
-            return {"choices": [{"text": content}]}
-        else:
-            def gen():
-                stream_resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    stream=True,
-                )
-                for chunk in stream_resp:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    token = delta.content or ""
-                    if token:
-                        yield {"choices": [{"text": token}]}
-            return gen()
+DEFAULT_API_KEY = Config.CHAT_API_KEY
+DEFAULT_ENTITY_BASE_URL = Config.ENTITY_BASE_URL
+DEFAULT_ENTITY_MODEL = Config.ENTITY_MODEL
 
 
 class QwenLLM:
@@ -111,9 +51,9 @@ class QwenLLM:
         chat_model = chat_model or DEFAULT_CHAT_MODEL
 
         if entity_base_url is None:
-            entity_base_url = base_url
+            entity_base_url = DEFAULT_ENTITY_BASE_URL or base_url
         if entity_model is None:
-            entity_model = chat_model
+            entity_model = DEFAULT_ENTITY_MODEL or chat_model
 
         logger.info(
             f"Initializing QwenLLM with OpenAI-compatible API: "
@@ -121,10 +61,8 @@ class QwenLLM:
         )
 
         # 主模型 & 实体抽取模型（可以用同一个）
-        self.llm = OpenAIChatLLM(base_url=base_url, api_key=api_key, model=chat_model)
-        self.entity_llm = OpenAIChatLLM(
-            base_url=entity_base_url, api_key=api_key, model=entity_model
-        )
+        self.llm = ChatOpenAI(base_url=base_url, api_key=api_key, model=chat_model)
+        self.entity_llm = ChatOpenAI(base_url=entity_base_url, api_key=api_key, model=entity_model)
 
         # 医学实体规范化映射（保留原来）
         self.entity_mappings = {
@@ -150,23 +88,23 @@ class QwenLLM:
         Returns:
             {"P": str|None, "I": str|None, "C": str|None, "O": str|None}
         """
-        model = self.entity_llm if self.entity_llm else self.llm
-        if not model:
+        if not self.entity_llm and not self.llm:
             logger.warning("No LLM loaded, returning empty PICO")
             return {"P": None, "I": None, "C": None, "O": None}
 
-        prompt = self._pico_extraction_prompt(text)
-
         try:
-            response = model(
-                prompt,
-                max_tokens=256,
-                temperature=0.1,
-                top_p=0.9,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
-                repeat_penalty=1.05
-            )
-            raw = (response["choices"][0]["text"] or "").strip()
+            raw = self._run_chain(
+                RunnableLambda(lambda value: self._pico_extraction_prompt(value))
+                | (self.entity_llm or self.llm).bind(
+                    max_tokens=256,
+                    temperature=0.1,
+                    top_p=0.9,
+                    stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+                    repeat_penalty=1.05
+                )
+                | StrOutputParser(),
+                text,
+            ).strip()
 
             pico = self._parse_pico_json(raw)
             if pico is not None:
@@ -174,16 +112,18 @@ class QwenLLM:
 
             # 解析失败：尝试二次“纠错输出”提示（仍然不走 stream）
             logger.warning("PICO JSON parse failed, trying repair prompt...")
-            repair_prompt = self._pico_repair_prompt(raw)
-            repair_resp = model(
-                repair_prompt,
-                max_tokens=256,
-                temperature=0.0,
-                top_p=1.0,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
-                repeat_penalty=1.0
-            )
-            repaired_raw = (repair_resp["choices"][0]["text"] or "").strip()
+            repaired_raw = self._run_chain(
+                RunnableLambda(lambda value: self._pico_repair_prompt(value))
+                | (self.entity_llm or self.llm).bind(
+                    max_tokens=256,
+                    temperature=0.0,
+                    top_p=1.0,
+                    stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+                    repeat_penalty=1.0
+                )
+                | StrOutputParser(),
+                raw,
+            ).strip()
             pico = self._parse_pico_json(repaired_raw)
             if pico is not None:
                 return pico
@@ -343,25 +283,23 @@ class QwenLLM:
             Dictionary with disease, drug, and population entities
         """
         # Use entity model if available, otherwise use main model
-        model = self.entity_llm if self.entity_llm else self.llm
-
-        if not model:
+        if not self.entity_llm and not self.llm:
             logger.warning("No LLM loaded, returning empty entities")
             return {"disease": None, "drug": None, "population": None}
 
-        prompt = PromptTemplates.entity_extraction_prompt(text)
-
         try:
-            response = model(
-                prompt,
-                max_tokens=128,
-                temperature=0.1,
-                top_p=0.9,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
-                repeat_penalty=1.1
-            )
-
-            result_text = response['choices'][0]['text'].strip()
+            result_text = self._run_chain(
+                RunnableLambda(lambda value: PromptTemplates.entity_extraction_prompt(value))
+                | (self.entity_llm or self.llm).bind(
+                    max_tokens=128,
+                    temperature=0.1,
+                    top_p=0.9,
+                    stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+                    repeat_penalty=1.1
+                )
+                | StrOutputParser(),
+                text,
+            ).strip()
 
             # Try to parse JSON
             try:
@@ -464,15 +402,15 @@ class QwenLLM:
         stop_sequences = PromptTemplates.get_stop_sequences()
 
         try:
-            response = self.llm(
+            answer = self._invoke_chat(
+                self.llm,
                 prompt,
                 max_tokens=max_tokens,
                 temperature=0.3,
                 top_p=0.95,
                 stop=stop_sequences,
                 repeat_penalty=1.1
-            )
-            answer = response['choices'][0]['text'].strip()
+            ).strip()
             # Clean up any remaining stop sequences
             for stop in stop_sequences:
                 answer = answer.split(stop)[0]
@@ -508,16 +446,15 @@ class QwenLLM:
         try:
             # Simply yield all tokens - we'll clean think tags from the accumulated text in the app
             token_count = 0
-            for output in self.llm(
+            for token in self._stream_chat(
+                self.llm,
                 prompt,
                 max_tokens=max_tokens,
                 temperature=0.3,
                 top_p=0.95,
                 stop=stop_sequences,
-                stream=True,
                 repeat_penalty=1.1
             ):
-                token = output['choices'][0]['text']
                 token_count += 1
 
                 # Just yield the token - llama.cpp will handle stop sequences
@@ -587,15 +524,15 @@ class QwenLLM:
             return self._stream_with_prompt(prompt, max_tokens, stop_sequences)
 
         try:
-            response = self.llm(
+            answer = self._invoke_chat(
+                self.llm,
                 prompt,
                 max_tokens=max_tokens,
                 temperature=0.4,
                 top_p=0.9,
                 stop=stop_sequences,
                 repeat_penalty=1.05
-            )
-            answer = response['choices'][0]['text'].strip()
+            ).strip()
             for stop in stop_sequences:
                 answer = answer.split(stop)[0]
             return self._clean_qwen3_output(answer)
@@ -606,16 +543,16 @@ class QwenLLM:
     def _stream_with_prompt(self, prompt: str, max_tokens: int, stop_sequences: List[str]) -> Generator[str, None, None]:
         """Helper for streaming a custom prompt."""
         try:
-            for output in self.llm(
+            for token in self._stream_chat(
+                self.llm,
                 prompt,
                 max_tokens=max_tokens,
                 temperature=0.4,
                 top_p=0.9,
                 stop=stop_sequences,
-                stream=True,
                 repeat_penalty=1.05
             ):
-                yield output['choices'][0]['text']
+                yield token
         except Exception as e:
             logger.error(f"Error in streaming decider answer: {e}")
             yield f"抱歉，生成回答时出现错误：{str(e)}"
@@ -669,15 +606,15 @@ class QwenLLM:
         prompt = MELANOMA_STAGING_EXTRACTION_PROMPT.format(question=question)
         stop_sequences = PromptTemplates.get_stop_sequences()
         try:
-            resp = self.llm(
+            text = self._invoke_chat(
+                self.llm,
                 prompt,
                 max_tokens=256,
                 temperature=0.2,
                 top_p=0.9,
                 stop=stop_sequences,
                 repeat_penalty=1.05
-            )
-            text = resp["choices"][0]["text"].strip()
+            ).strip()
             # Clean any stop tokens
             for stop in stop_sequences:
                 text = text.split(stop)[0]
@@ -708,3 +645,53 @@ class QwenLLM:
                 "ldh": "unknown"
             }
         }
+
+    @staticmethod
+    def _invoke_chat(
+        llm: ChatOpenAI,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: Optional[List[str]],
+        repeat_penalty: Optional[float],
+    ) -> str:
+        params: Dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if stop:
+            params["stop"] = stop
+        if repeat_penalty is not None:
+            params["repeat_penalty"] = repeat_penalty
+        response = llm.invoke(prompt, **params)
+        return response.content or ""
+
+    @staticmethod
+    def _stream_chat(
+        llm: ChatOpenAI,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: Optional[List[str]],
+        repeat_penalty: Optional[float],
+    ) -> Generator[str, None, None]:
+        params: Dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if stop:
+            params["stop"] = stop
+        if repeat_penalty is not None:
+            params["repeat_penalty"] = repeat_penalty
+        for chunk in llm.stream(prompt, **params):
+            token = chunk.content or ""
+            if token:
+                yield token
+
+    @staticmethod
+    def _run_chain(chain, payload: str) -> str:
+        return chain.invoke(payload)

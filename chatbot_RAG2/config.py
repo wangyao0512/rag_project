@@ -21,6 +21,7 @@ class Config:
     # Chat 模型（Qwen 大模型）
     CHAT_BASE_URL = os.getenv("CHAT_BASE_URL", "http://10.6.52.31:1025/v1")
     CHAT_MODEL = os.getenv("CHAT_MODEL", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+    CHAT_API_KEY = os.getenv("CHAT_API_KEY", os.getenv("OPENAI_API_KEY", "-"))
 
     # Embedding 模型（Qwen3-Embedding-8B）
     EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "http://10.6.12.215:6091/v1")
@@ -28,6 +29,8 @@ class Config:
 
     # API Key（自托管一般无所谓，保持 dummy 即可）
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "-")
+    ENTITY_BASE_URL = os.getenv("ENTITY_BASE_URL", CHAT_BASE_URL)
+    ENTITY_MODEL = os.getenv("ENTITY_MODEL", CHAT_MODEL)
     MAX_CONTEXT_LENGTH = int(os.getenv("MEDICAL_RAG_MAX_CONTEXT", "4096"))
     MAX_NEW_TOKENS = int(os.getenv("MEDICAL_RAG_MAX_TOKENS", "1024"))
     # Tooling
