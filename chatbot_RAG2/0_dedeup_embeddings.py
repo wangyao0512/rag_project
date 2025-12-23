@@ -23,10 +23,10 @@ from tqdm import tqdm
 
 from collections import defaultdict
 try:
-    from openai import OpenAI
+    from langchain_openai import OpenAIEmbeddings
 except Exception as e:
     raise RuntimeError(
-        "Missing dependency: openai. Install with: pip install -U openai"
+        "Missing dependency: langchain-openai. Install with: pip install -U langchain-openai"
     ) from e
 
 
@@ -212,7 +212,7 @@ def load_items(input_dir: Path) -> List[Item]:
 #             vecs.append(np.array(d.embedding, dtype=np.float32))
 #         i += batch_size
 #     return vecs
-def embed_texts(client: OpenAI, model: str, texts: List[str], batch_size: int) -> List[np.ndarray]:
+def embed_texts(embedder: OpenAIEmbeddings, texts: List[str], batch_size: int) -> List[np.ndarray]:
     vecs: List[np.ndarray] = []
     i = 0
     # 使用 tqdm 包装循环以展示进度条
@@ -220,12 +220,9 @@ def embed_texts(client: OpenAI, model: str, texts: List[str], batch_size: int) -
     with tqdm(total=total_batches, desc="Generating embeddings") as pbar:
         while i < len(texts):
             chunk = texts[i:i + batch_size]
-            # OpenAI embeddings API: input can be list[str]
-            resp = client.embeddings.create(model=model, input=chunk)
-            # 保证按顺序
-            data_sorted = sorted(resp.data, key=lambda d: d.index)
-            for d in data_sorted:
-                vecs.append(np.array(d.embedding, dtype=np.float32))
+            embeddings = embedder.embed_documents(chunk)
+            for embedding in embeddings:
+                vecs.append(np.array(embedding, dtype=np.float32))
             i += batch_size
             pbar.update(1)  # 更新进度条
     return vecs
@@ -255,10 +252,14 @@ def main(
     if not in_dir.exists():
         raise FileNotFoundError(f"input_dir not found: {in_dir}")
 
-    # OpenAI client（支持你本地 OpenAI 兼容服务：设置 base_url 即可）
+    # LangChain embeddings client（支持你本地 OpenAI 兼容服务：设置 base_url 即可）
     api_key = api_key or os.getenv("OPENAI_API_KEY", "")
     base_url = base_url or os.getenv("OPENAI_BASE_URL", None)
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    embedder = OpenAIEmbeddings(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+    )
 
     items = load_items(in_dir)
     if not items:
@@ -284,7 +285,7 @@ def main(
 
     # Embedding
     texts = [it.embed_text for it in items]
-    vecs = embed_texts(client, model=model, texts=texts, batch_size=embed_batch)
+    vecs = embed_texts(embedder, texts=texts, batch_size=embed_batch)
     for it, v in zip(items, vecs):
         it.vec = v
 

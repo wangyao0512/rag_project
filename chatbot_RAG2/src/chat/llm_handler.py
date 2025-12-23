@@ -1,12 +1,13 @@
 """
-LLM handler using OpenAI-compatible Qwen HTTP API
+LLM handler using LangChain's OpenAI-compatible Qwen HTTP API
 """
 from typing import Dict, List, Optional, Generator, Union, Any
 import json
 import os
 import re
 from loguru import logger
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 from config import Config
 from src.chat.prompts import PromptTemplates, RefusalMessages
 from src.prompts.two_stage_prompts import DECIDER_PROMPT, MELANOMA_STAGING_EXTRACTION_PROMPT
@@ -20,14 +21,17 @@ DEFAULT_API_KEY = Config.OPENAI_API_KEY
 
 class OpenAIChatLLM:
     """
-    一个小封装，让 OpenAI Chat 接口看起来像 llama_cpp 的 Llama：
+    一个小封装，让 LangChain Chat 接口看起来像 llama_cpp 的 Llama：
     - 非流式：返回 {"choices": [{"text": "...."}]}
     - 流式：yield {"choices": [{"text": "token"}]}
     """
 
     def __init__(self, base_url: str, api_key: str, model: str):
-        self.client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key)
-        self.model = model
+        self.client = ChatOpenAI(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key,
+            model=model,
+        )
 
     def __call__(
         self,
@@ -40,42 +44,23 @@ class OpenAIChatLLM:
         repeat_penalty: Optional[float] = None,  # 兼容 llama_cpp，占位即可
         **kwargs,
     ):
-        messages = [
-            {
-                "role": "user",
-                # 你的 prompt 本身已经带 <|im_start|>system/user 等标签，直接塞进去即可
-                "content": prompt,
-            }
-        ]
+        messages = [HumanMessage(content=prompt)]
+
+        bound = self.client.bind(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
 
         if not stream:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                stream=False,
-            )
-            content = resp.choices[0].message.content or ""
+            resp = bound.invoke(messages)
+            content = resp.content or ""
             return {"choices": [{"text": content}]}
         else:
             def gen():
-                stream_resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    stream=True,
-                )
-                for chunk in stream_resp:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    token = delta.content or ""
+                for chunk in bound.stream(messages):
+                    token = chunk.content or ""
                     if token:
                         yield {"choices": [{"text": token}]}
             return gen()
