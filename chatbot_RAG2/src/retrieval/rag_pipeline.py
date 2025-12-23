@@ -5,13 +5,14 @@ from src.database.schema import MedicalDatabase
 from src.retrieval.vector_store import VectorStore
 from src.chat.llm_handler import QwenLLM
 from src.chat.cot_reasoner import CoTReasoner
+from src.chat.prompts import PromptTemplates
 import json
-from typing import List, Dict, Optional, Generator, Union
+from typing import List, Dict, Optional, Generator, Union, Any
+from langchain_core.runnables import RunnableBranch, RunnableLambda
 from src.retrieval.two_stage import Reader, Decider
 from src.retrieval.evidence_models import ReaderInput
 from loguru import logger
 from config import Config
-from typing import Any, Dict, Optional
 try:
     import src.retrieval.melanoma_staging_mcp_server as melanoma_staging_mcp_server
 except Exception as e:
@@ -425,6 +426,262 @@ class MedicalRAG:
             logger.error(f"Failed to run melanoma staging tool: {e}")
             return None
 
+    def _should_use_staging_tool(self, query: str, cot_analysis: Optional[Dict]) -> bool:
+        lowered = query.lower()
+        staging_keywords = ["分期", "分组", "staging", "stage", "tnm", "ajcc", "csco"]
+        treatment_keywords = ["治疗", "方案", "用药", "手术", "免疫", "靶向", "化疗", "放疗", "辅助", "adjuvant", "neoadjuvant", "metastatic", "复发", "转移"]
+        melanoma_hit = ("黑色素瘤" in query) or ("melanoma" in lowered)
+        staging_hit = any(k in lowered for k in staging_keywords)
+        treatment_hit = any(k in lowered for k in treatment_keywords)
+        cot_staging = bool(cot_analysis.get("needs_melanoma_staging")) if cot_analysis else False
+        return melanoma_hit and (staging_hit or treatment_hit or cot_staging)
+
+    def _build_refusal_payload(self, query: str, cot_analysis: Dict) -> Dict:
+        refusal_msg = self.cot_reasoner.get_refusal_message(cot_analysis)
+        return {
+            'query': query,
+            'entities': {},
+            'normalized_entities': {},
+            'answer': refusal_msg,
+            'sources': [],
+            'num_sources': 0,
+            'cot_analysis': cot_analysis,
+            'refused': True
+        }
+
+    def _stream_answer_payload(self, query: str, context: List[Dict], cot_analysis: Optional[Dict],
+                               entities: Dict, normalized_entities: Dict, stream: bool):
+        if not stream:
+            answer = self.llm.generate_answer(query, context, stream=False)
+            return {
+                'query': query,
+                'entities': entities,
+                'normalized_entities': normalized_entities,
+                'answer': answer,
+                'sources': context,
+                'num_sources': len(context),
+                'cot_analysis': cot_analysis,
+                'refused': False
+            }
+
+        def generate():
+            for token in self.llm.generate_answer(query, context, stream=True):
+                yield {
+                    'token': token,
+                    'entities': entities,
+                    'normalized_entities': normalized_entities,
+                    'sources': context,
+                    'num_sources': len(context),
+                    'cot_analysis': cot_analysis
+                }
+        return generate()
+
+    def _run_tool_chain(self, payload: Dict) -> Union[Dict, Generator]:
+        query = payload["query"]
+        stream = payload["stream"]
+        session_id = payload.get("session_id")
+        cot_analysis = payload.get("cot_analysis")
+
+        staging_chunk = self._maybe_compute_melanoma_staging(query, session_id=session_id)
+        if not staging_chunk:
+            return self._run_rag_chain(payload)
+
+        staging_meta = staging_chunk.get("metadata", {}).get("staging", {})
+        missing_fields = staging_meta.get("missing_fields", [])
+        if missing_fields:
+            if session_id:
+                self.staging_sessions[session_id] = staging_chunk.get("metadata", {}).get("staging_input", {})
+            followup = (
+                "为了准确进行黑色素瘤分期，请补充以下信息："
+                + "、".join(missing_fields)
+                + "。例如：Breslow厚度(毫米)、是否有溃疡、阳性淋巴结个数、是否临床可见、是否有远处转移及部位、LDH情况。"
+            )
+            return {
+                'query': query,
+                'answer': followup,
+                'need_followup': True,
+                'missing_fields': missing_fields,
+                'staging_input': staging_chunk.get("metadata", {}).get("staging_input", {}),
+                'session_id': session_id,
+                'refused': False
+            }
+
+        if session_id and session_id in self.staging_sessions:
+            self.staging_sessions.pop(session_id, None)
+
+        return self._stream_answer_payload(
+            query=query,
+            context=[staging_chunk],
+            cot_analysis=cot_analysis,
+            entities={},
+            normalized_entities={},
+            stream=stream
+        )
+
+    def _run_chat_chain(self, payload: Dict) -> Union[Dict, Generator]:
+        query = payload["query"]
+        stream = payload["stream"]
+        cot_analysis = payload.get("cot_analysis")
+        prompt = PromptTemplates.simple_chat_prompt(query)
+        stop_sequences = PromptTemplates.get_stop_sequences()
+
+        if not stream:
+            response = self.llm.llm(
+                prompt,
+                max_tokens=Config.MAX_NEW_TOKENS,
+                temperature=0.7,
+                top_p=0.9,
+                stop=stop_sequences,
+                repeat_penalty=1.05
+            )
+            answer = response['choices'][0]['text'].strip()
+            return {
+                'query': query,
+                'entities': {},
+                'normalized_entities': {},
+                'answer': answer,
+                'sources': [],
+                'num_sources': 0,
+                'cot_analysis': cot_analysis,
+                'refused': False
+            }
+
+        def generate():
+            for output in self.llm.llm(
+                prompt,
+                max_tokens=Config.MAX_NEW_TOKENS,
+                temperature=0.7,
+                top_p=0.9,
+                stop=stop_sequences,
+                stream=True,
+                repeat_penalty=1.05
+            ):
+                token = output['choices'][0]['text']
+                yield {
+                    'token': token,
+                    'entities': {},
+                    'normalized_entities': {},
+                    'sources': [],
+                    'num_sources': 0,
+                    'cot_analysis': cot_analysis
+                }
+        return generate()
+
+    def _run_rag_chain(self, payload: Dict) -> Union[Dict, Generator]:
+        query = payload["query"]
+        max_context_chunks = payload["max_context_chunks"]
+        stream = payload["stream"]
+        extract_entities = payload["extract_entities"]
+        session_id = payload.get("session_id")
+        cot_analysis = payload.get("cot_analysis")
+
+        route_info = self._route_store(query)
+        db = route_info["db"]
+        vector_store = route_info["vector_store"]
+        pico = route_info["pico"]
+        route = route_info["route"]
+        logger.info(f"[RAG route] route={route}, pico_keys={list(pico.keys())}")
+        entities = {}
+        normalized_entities = {}
+        if extract_entities:
+            entities = self.llm.extract_entities(query)
+            for key, value in entities.items():
+                if value:
+                    normalized_entities[key] = self.normalize_entity(value)
+
+            if any(entities.values()):
+                structured_results = self.search_structured(db, entities)
+                structured_chunks = self.get_chunks_from_evidence(db, structured_results)
+            else:
+                structured_chunks = []
+        else:
+            structured_chunks = []
+        if route == "pico":
+            pico_parts = []
+            for key in ["P", "I", "C", "O"]:
+                if pico.get(key):
+                    pico_parts.append(pico[key])
+            pico_query = ",".join(pico_parts) if pico_parts else query
+            vector_chunks = self.search_vector(vector_store, db, pico_query, n_results=max_context_chunks * 2)
+        else:
+            vector_chunks = self.search_vector(vector_store, db, query, n_results=max_context_chunks * 2)
+
+        if extract_entities and entities and any(entities.values()):
+            vector_chunks = self.filter_chunks_by_entities(vector_chunks, entities)
+
+        all_chunks = self.combine_results(structured_chunks, vector_chunks, max_total=max_context_chunks)
+
+        evidence_bundle = None
+        if self.use_two_stage and self.reader:
+            try:
+                reader_input = ReaderInput(
+                    question_text=query,
+                    patient_profile={},
+                    retrieved_items=all_chunks
+                )
+                evidence_bundle = self.reader.build_evidence_bundle(reader_input)
+            except Exception as bundle_err:
+                logger.error(f"Failed to build evidence bundle: {bundle_err}")
+
+        use_two_stage_path = self.use_two_stage and evidence_bundle is not None
+
+        if stream:
+            def generate():
+                if use_two_stage_path:
+                    try:
+                        for token in self.llm.generate_decider_answer(query, evidence_bundle, stream=True):
+                            payload = {
+                                'token': token,
+                                'entities': entities,
+                                'normalized_entities': normalized_entities,
+                                'sources': all_chunks,
+                                'num_sources': len(all_chunks),
+                                'cot_analysis': cot_analysis,
+                                'evidence_bundle': evidence_bundle.model_dump()
+                            }
+                            yield payload
+                        return
+                    except Exception as decider_err:
+                        logger.error(f"Two-stage streaming failed, falling back: {decider_err}")
+
+                for token in self.llm.generate_answer(query, all_chunks, stream=True):
+                    payload = {
+                        'token': token,
+                        'entities': entities,
+                        'normalized_entities': normalized_entities,
+                        'sources': all_chunks,
+                        'num_sources': len(all_chunks),
+                        'cot_analysis': cot_analysis
+                    }
+                    if evidence_bundle:
+                        payload['evidence_bundle'] = evidence_bundle.model_dump()
+                    yield payload
+            return generate()
+
+        try:
+            if use_two_stage_path:
+                answer = self.llm.generate_decider_answer(query, evidence_bundle, stream=False)
+            else:
+                answer = self.llm.generate_answer(query, all_chunks, stream=False)
+        except Exception as gen_err:
+            logger.error(f"Two-stage generation failed, falling back: {gen_err}")
+            answer = self.llm.generate_answer(query, all_chunks, stream=False)
+
+        result = {
+            'query': query,
+            'entities': entities,
+            'normalized_entities': normalized_entities,
+            'answer': answer,
+            'sources': all_chunks,
+            'num_sources': len(all_chunks),
+            'cot_analysis': cot_analysis,
+            'refused': False
+        }
+        if evidence_bundle:
+            result['evidence_bundle'] = evidence_bundle.model_dump()
+        logger.info("Query processing complete")
+        return result
+
     def _normalize_pico_value(self, v: Any) -> Optional[str]:
         """把各种 null/空/列表 统一成 str 或 None"""
         if v is None:
@@ -519,171 +776,40 @@ class MedicalRAG:
         
         logger.info(f"Processing query: {query}")
 
-        # Step 0: CoT
         cot_analysis = None
         if use_cot:
             logger.info("Performing CoT analysis...")
             cot_analysis = self.cot_reasoner.analyze_query(query)
+            self.last_cot = cot_analysis
             logger.info(f"CoT Result: is_medical={cot_analysis['is_medical']}, needs_staging={cot_analysis.get('needs_melanoma_staging')}, reasoning={cot_analysis['reasoning']}")
 
-            # Check if query should be refused
             if self.cot_reasoner.should_refuse(cot_analysis):
                 logger.info("Query refused: non-medical content")
-                refusal_msg = self.cot_reasoner.get_refusal_message(cot_analysis)
-                return {
-                    'query': query,
-                    'entities': {},
-                    'normalized_entities': {},
-                    'answer': refusal_msg,
-                    'sources': [],
-                    'num_sources': 0,
-                    'cot_analysis': cot_analysis,
-                    'refused': True
-                }
+                return self._build_refusal_payload(query, cot_analysis)
 
-        # 提取实体，提取结构化pico信息
-        route_info = self._route_store(query)
-        db = route_info["db"]
-        vector_store = route_info["vector_store"]
-        pico = route_info["pico"]
-        route = route_info["route"]
-        logger.info(f"[RAG route] route={route}, pico_keys={list(pico.keys())}")
-        entities = {}
-        normalized_entities = {}
-        if extract_entities:
-            entities = self.llm.extract_entities(query)
-            for key, value in entities.items():
-                if value:
-                    normalized_entities[key] = self.normalize_entity(value)
+        route = "chat"
+        if self._should_use_staging_tool(query, cot_analysis):
+            route = "tool"
+        elif cot_analysis and cot_analysis.get("is_medical"):
+            route = "rag"
 
-            if any(entities.values()):
-                structured_results = self.search_structured(db, entities)
-                structured_chunks = self.get_chunks_from_evidence(db, structured_results)
-            else:
-                structured_chunks = []
-        else:
-            structured_chunks = []
-        if route == "pico":
-            pico_parts = []
-            for key in ["P", "I", "C", "O"]:
-                if pico.get(key):
-                    pico_parts.append(pico[key])
-            pico_query = ",".join(pico_parts) if pico_parts else query
-            vector_chunks = self.search_vector(vector_store, db, pico_query, n_results=max_context_chunks * 2)
-        else:
-            vector_chunks = self.search_vector(vector_store, db, query, n_results=max_context_chunks * 2)
+        payload = {
+            "query": query,
+            "max_context_chunks": max_context_chunks,
+            "stream": stream,
+            "extract_entities": extract_entities,
+            "session_id": session_id,
+            "cot_analysis": cot_analysis,
+            "route": route
+        }
 
+        router = RunnableBranch(
+            (lambda x: x["route"] == "tool", RunnableLambda(self._run_tool_chain)),
+            (lambda x: x["route"] == "rag", RunnableLambda(self._run_rag_chain)),
+            RunnableLambda(self._run_chat_chain),
+        )
 
-
-        if extract_entities and entities and any(entities.values()):
-            vector_chunks = self.filter_chunks_by_entities(vector_chunks, entities)
-
-        # Step 4.6: Optional melanoma staging tool (pre-context)
-        staging_chunk = self._maybe_compute_melanoma_staging(query, session_id=session_id)
-        if staging_chunk:
-            vector_chunks = [staging_chunk] + vector_chunks
-            # If staging is incomplete, ask user for missing fields before proceeding
-            staging_meta = staging_chunk.get("metadata", {}).get("staging", {})
-            missing_fields = staging_meta.get("missing_fields", [])
-            if missing_fields:
-                if session_id:
-                    self.staging_sessions[session_id] = staging_chunk.get("metadata", {}).get("staging_input", {})
-                followup = (
-                    "为了准确进行黑色素瘤分期，请补充以下信息："
-                    + "、".join(missing_fields)
-                    + "。例如：Breslow厚度(毫米)、是否有溃疡、阳性淋巴结个数、是否临床可见、是否有远处转移及部位、LDH情况。"
-                )
-                return {
-                    'query': query,
-                    'answer': followup,
-                    'need_followup': True,
-                    'missing_fields': missing_fields,
-                    'staging_input': staging_chunk.get("metadata", {}).get("staging_input", {}),
-                    'session_id': session_id,
-                    'refused': False
-                }
-            else:
-                # Staging complete; clear stored state for this session
-                if session_id and session_id in self.staging_sessions:
-                    self.staging_sessions.pop(session_id, None)
-
-
-
-        all_chunks = self.combine_results(structured_chunks, vector_chunks, max_total=max_context_chunks)
-
-        # Step 6: Generate answer (two-stage optional)
-        logger.info("Generating answer...")
-        evidence_bundle = None
-        if self.use_two_stage and self.reader:
-            try:
-                reader_input = ReaderInput(
-                    question_text=query,
-                    patient_profile={},
-                    retrieved_items=all_chunks
-                )
-                evidence_bundle = self.reader.build_evidence_bundle(reader_input)
-            except Exception as bundle_err:
-                logger.error(f"Failed to build evidence bundle: {bundle_err}")
-
-        # Decide which generator to use
-        use_two_stage_path = self.use_two_stage and evidence_bundle is not None
-
-        if stream:
-            def generate():
-                if use_two_stage_path:
-                    try:
-                        for token in self.llm.generate_decider_answer(query, evidence_bundle, stream=True):
-                            payload = {
-                                'token': token,
-                                'entities': entities,
-                                'normalized_entities': normalized_entities,
-                                'sources': all_chunks,
-                                'num_sources': len(all_chunks),
-                                'cot_analysis': cot_analysis,
-                                'evidence_bundle': evidence_bundle.model_dump()
-                            }
-                            yield payload
-                        return
-                    except Exception as decider_err:
-                        logger.error(f"Two-stage streaming failed, falling back: {decider_err}")
-
-                for token in self.llm.generate_answer(query, all_chunks, stream=True):
-                    payload = {
-                        'token': token,
-                        'entities': entities,
-                        'normalized_entities': normalized_entities,
-                        'sources': all_chunks,
-                        'num_sources': len(all_chunks),
-                        'cot_analysis': cot_analysis
-                    }
-                    if evidence_bundle:
-                        payload['evidence_bundle'] = evidence_bundle.model_dump()
-                    yield payload
-            return generate()
-        else:
-            try:
-                if use_two_stage_path:
-                    answer = self.llm.generate_decider_answer(query, evidence_bundle, stream=False)
-                else:
-                    answer = self.llm.generate_answer(query, all_chunks, stream=False)
-            except Exception as gen_err:
-                logger.error(f"Two-stage generation failed, falling back: {gen_err}")
-                answer = self.llm.generate_answer(query, all_chunks, stream=False)
-
-            result = {
-                'query': query,
-                'entities': entities,
-                'normalized_entities': normalized_entities,
-                'answer': answer,
-                'sources': all_chunks,  # Return all sources (up to max_context_chunks)
-                'num_sources': len(all_chunks),
-                'cot_analysis': cot_analysis,
-                'refused': False
-            }
-            if evidence_bundle:
-                result['evidence_bundle'] = evidence_bundle.model_dump()
-            logger.info("Query processing complete")
-            return result
+        return router.invoke(payload)
 
     def add_knowledge(self, evidence: Dict, chunks: List[Dict], route: str = "llm"):
         """Add new medical knowledge to the system (default into LLM store)"""

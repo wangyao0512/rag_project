@@ -9,7 +9,8 @@ import uuid
 from pathlib import Path
 from loguru import logger
 import yaml
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 import time
 import re
 import traceback
@@ -44,7 +45,11 @@ def process_single_reference(reference):
     model_name = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     openai_api_key = "-"
     
-    client = OpenAI(base_url=base_url, api_key=openai_api_key)
+    client = ChatOpenAI(
+        base_url=base_url,
+        api_key=openai_api_key,
+        model=model_name,
+    )
     
     # 构建提示模板，使用当前的references
     prompt_template = '''
@@ -83,23 +88,18 @@ def process_single_reference(reference):
     formatted_prompt = prompt_template.format(reference=reference)
     
     messages = [
-        {"role": "system", "content": "你是一个专业的医学专家助手，请根据以下信息进行输出，不输出额外内容，请输出json格式，格式为：{\"grade\": xxx, \"country\": xxx, \"guideline_focus\": xxx}"},
-        {"role": "user", "content": formatted_prompt}
+        SystemMessage(content="你是一个专业的医学专家助手，请根据以下信息进行输出，不输出额外内容，请输出json格式，格式为：{\"grade\": xxx, \"country\": xxx, \"guideline_focus\": xxx}"),
+        HumanMessage(content=formatted_prompt),
     ]
     
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
+        response = client.invoke(
+            messages,
             temperature=0.1,
             max_tokens=1024,
             top_p=1,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=None
         )
-        
-        response_text = response.choices[0].message.content
+        response_text = response.content
 
         
         # 尝试解析JSON响应
@@ -215,6 +215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
